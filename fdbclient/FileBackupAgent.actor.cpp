@@ -50,6 +50,7 @@
 #include "fdbclient/Tenant.h"
 #include "flow/network.h"
 #include "flow/Trace.h"
+#include "flow/UnitTest.h"
 
 #include <cinttypes>
 #include <cstdint>
@@ -215,6 +216,7 @@ public:
 	KeyBackedProperty<Version> beginVersion() { return configSpace.pack(__FUNCTION__sr); }
 	KeyBackedProperty<Version> restoreVersion() { return configSpace.pack(__FUNCTION__sr); }
 	KeyBackedProperty<Version> firstConsistentVersion() { return configSpace.pack(__FUNCTION__sr); }
+	KeyBackedProperty<Version> maxLogFileSpan() { return configSpace.pack(__FUNCTION__sr); }
 
 	KeyBackedProperty<Reference<IBackupContainer>> sourceContainer() { return configSpace.pack(__FUNCTION__sr); }
 	// Get the source container as a bare URL, without creating a container instance
@@ -5122,9 +5124,81 @@ Standalone<VectorRef<KeyValueRef>> generateOldFormatMutations(
 	return results;
 }
 
+// Log metadata is ordered by (begin version, filename, ...), so a file can start before the window
+// and overlap it even if a later file has already ended.
+struct PartitionedLogFileScan {
+	RestoreConfig::FileSetT files;
+	Version beginVersion;
+	Key nextKey;
+	Key endKey;
+	std::vector<RestoreConfig::RestoreFile> logs;
+	int64_t maxTagID = 0;
+
+	PartitionedLogFileScan() = default;
+	PartitionedLogFileScan(RestoreConfig::FileSetT files, Version begin, Version end, Optional<Version> maxSpan)
+	  : files(files), beginVersion(begin),
+	    nextKey(maxSpan.present() ? files.packKey({ std::max<Version>(0, begin - maxSpan.get()), "", false })
+	                              : files.subspace.begin),
+	    endKey(files.packKey({ end, "", false })) {}
+
+	bool consume(const RangeResult& page) {
+		for (const auto& kv : page) {
+			auto file = files.unpackKey(kv.key);
+			if (file.endVersion > beginVersion) {
+				maxTagID = std::max(maxTagID, file.tagId);
+				logs.push_back(std::move(file));
+			}
+		}
+		if (page.more) {
+			ASSERT(!page.empty());
+			nextKey = keyAfter(page.back().key);
+		}
+		return page.more;
+	}
+};
+
+TEST_CASE("/backup/restore/partitionedLogFilePagination") {
+	RestoreConfig::FileSetT files("logFiles/"_sr);
+	std::vector<Key> manifest;
+	auto add = [&](Version begin, Version end, std::string name, int tag) {
+		manifest.push_back(files.packKey({ begin, name, false, 1, 1, end, tag, 4 }));
+	};
+	for (int i = 0; i < 999; ++i) {
+		add(i, i + 1, "expired", 0);
+	}
+	add(1005, 2025, "a", 3);
+	add(1005, 2012, "b", 1);
+	add(1500, 2000, "ends-at-begin", 0);
+	add(2000, 2010, "c", 2);
+	add(2010, 2015, "starts-at-end", 0);
+	for (Optional<Version> span : { Optional<Version>(), Optional<Version>(1020) }) {
+		PartitionedLogFileScan scan(files, 2000, 2010, span);
+		int pages = 0;
+		for (;;) {
+			RangeResult page;
+			auto it = std::lower_bound(manifest.begin(), manifest.end(), scan.nextKey);
+			for (; it != manifest.end() && *it < scan.endKey && page.size() < 1000; ++it) {
+				page.push_back_deep(page.arena(), KeyValueRef(*it, ValueRef()));
+			}
+			page.more = it != manifest.end() && *it < scan.endKey;
+			++pages;
+			if (!scan.consume(page)) {
+				break;
+			}
+		}
+		ASSERT_EQ(pages, span.present() ? 1 : 2);
+		ASSERT_EQ(scan.logs.size(), 3);
+		ASSERT_EQ(scan.logs[0].fileName, "a");
+		ASSERT_EQ(scan.logs[1].fileName, "b");
+		ASSERT_EQ(scan.logs[2].fileName, "c");
+		ASSERT_EQ(scan.maxTagID, 3);
+	}
+	return Void();
+}
+
 struct RestoreLogDataPartitionedTaskFunc : RestoreFileTaskFuncBase {
 	static StringRef name;
-	static constexpr uint32_t version = 1;
+	static constexpr uint32_t version = 2;
 	StringRef getName() const override { return name; };
 
 	static struct {
@@ -5293,14 +5367,13 @@ struct RestoreLogDataPartitionedTaskFunc : RestoreFileTaskFuncBase {
 	                                   Reference<Task> task) {
 		state RestoreConfig restore(task);
 
-		state int64_t maxTagID = Params.maxTagID().get(task);
-		state std::vector<RestoreConfig::RestoreFile> logs = Params.logs().get(task);
 		state Version begin = Params.beginVersion().get(task);
 		state Version end = Params.endVersion().get(task);
 
 		state Reference<ReadYourWritesTransaction> tr(new ReadYourWritesTransaction(cx));
 		state Reference<IBackupContainer> bc;
 		state std::vector<KeyRange> ranges; // this is the actual KV, not version
+		state Optional<Version> maxSpan;
 		loop {
 			try {
 				tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
@@ -5310,6 +5383,7 @@ struct RestoreLogDataPartitionedTaskFunc : RestoreFileTaskFuncBase {
 				bc = getBackupContainerWithProxy(_bc);
 
 				wait(store(ranges, restore.getRestoreRangesOrDefault(tr)));
+				wait(store(maxSpan, restore.maxLogFileSpan().get(tr)));
 
 				wait(checkTaskVersion(tr->getDatabase(), task, name, version));
 				wait(taskBucket->keepRunning(tr, task));
@@ -5320,10 +5394,29 @@ struct RestoreLogDataPartitionedTaskFunc : RestoreFileTaskFuncBase {
 			}
 		}
 
-		std::vector<std::vector<RestoreConfig::RestoreFile>> filesByTag(maxTagID + 1);
-		std::vector<std::vector<Version>> fileEndVersionByTag(maxTagID + 1);
+		// The manifest is immutable during dispatch, so pages can be read at different read versions.
+		state PartitionedLogFileScan scan(restore.logFileSet(), begin, end, maxSpan);
+		state int pageSize = BUGGIFY ? 1 : 1000;
+		tr->reset();
+		loop {
+			try {
+				tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+				tr->setOption(FDBTransactionOptions::LOCK_AWARE);
+				wait(taskBucket->keepRunning(tr, task));
+				RangeResult page = wait(tr->getRange(KeyRangeRef(scan.nextKey, scan.endKey), pageSize));
+				if (!scan.consume(page)) {
+					break;
+				}
+				tr->reset();
+			} catch (Error& e) {
+				wait(tr->onError(e));
+			}
+		}
 
-		for (RestoreConfig::RestoreFile& f : logs) {
+		std::vector<std::vector<RestoreConfig::RestoreFile>> filesByTag(scan.maxTagID + 1);
+		std::vector<std::vector<Version>> fileEndVersionByTag(scan.maxTagID + 1);
+
+		for (RestoreConfig::RestoreFile& f : scan.logs) {
 			// find the tag, aggregate files by tags
 			if (f.tagId == -1) {
 				// inconsistent data
@@ -5335,7 +5428,7 @@ struct RestoreLogDataPartitionedTaskFunc : RestoreFileTaskFuncBase {
 				filesByTag[f.tagId].push_back(f);
 			}
 		}
-		for (int i = 0; i < maxTagID + 1; i++) {
+		for (int i = 0; i < scan.maxTagID + 1; i++) {
 			std::vector<RestoreConfig::RestoreFile>& files = filesByTag[i];
 			int cnt = files.size();
 			fileEndVersionByTag[i].resize(cnt);
@@ -5349,7 +5442,7 @@ struct RestoreLogDataPartitionedTaskFunc : RestoreFileTaskFuncBase {
 			}
 		}
 
-		state std::vector<Reference<PartitionedLogIterator>> iterators(maxTagID + 1);
+		state std::vector<Reference<PartitionedLogIterator>> iterators(scan.maxTagID + 1);
 		// for each tag, create an iterator
 		for (int k = 0; k < filesByTag.size(); k++) {
 			iterators[k] =
@@ -5359,7 +5452,7 @@ struct RestoreLogDataPartitionedTaskFunc : RestoreFileTaskFuncBase {
 		DisabledTraceEvent("FileRestorePartitionedLogDataExeStart")
 		    .detail("BeginVersion", begin)
 		    .detail("EndVersion", end)
-		    .detail("Files", logs.size())
+		    .detail("Files", scan.logs.size())
 		    .detail("TaskInstance", THIS_ADDR);
 
 		// Converted backup mutations
@@ -5397,7 +5490,7 @@ struct RestoreLogDataPartitionedTaskFunc : RestoreFileTaskFuncBase {
 		DisabledTraceEvent("FileRestorePartitionedLogDataExeDone")
 		    .detail("BeginVersion", begin)
 		    .detail("EndVersion", end)
-		    .detail("Files", logs.size())
+		    .detail("Files", scan.logs.size())
 		    .detail("TaskInstance", THIS_ADDR);
 
 		return Void();
@@ -5430,8 +5523,6 @@ struct RestoreLogDataPartitionedTaskFunc : RestoreFileTaskFuncBase {
 	ACTOR static Future<Key> addTask(Reference<ReadYourWritesTransaction> tr,
 	                                 Reference<TaskBucket> taskBucket,
 	                                 Reference<Task> parentTask,
-	                                 int64_t maxTagID,
-	                                 std::vector<RestoreConfig::RestoreFile> logs,
 	                                 Version begin,
 	                                 Version end,
 	                                 TaskCompletionKey completionKey,
@@ -5443,10 +5534,11 @@ struct RestoreLogDataPartitionedTaskFunc : RestoreFileTaskFuncBase {
 		// Create a restore config from the current task and bind it to the new task.
 		// RestoreConfig(parentTask) createsa prefix of : fileRestorePrefixRange.begin/uid->config/[uid]
 		wait(RestoreConfig(parentTask).toTask(tr, task));
-		Params.maxTagID().set(task, maxTagID);
+		// Version 1 agents decode these fields before checking the task version.
+		Params.maxTagID().set(task, 0);
 		Params.beginVersion().set(task, begin);
 		Params.endVersion().set(task, end);
-		Params.logs().set(task, logs);
+		Params.logs().set(task, {});
 		Params.bytesWritten().set(task, 0);
 
 		if (!waitFor) {
@@ -5539,25 +5631,6 @@ struct RestoreDispatchPartitionedTaskFunc : RestoreTaskFuncBase {
 			return Void();
 		}
 
-		// Get a batch of files.  We're targeting batchSize blocks(30k) being dispatched so query for batchSize(150)
-		// files (each of which is 0 or more blocks).
-		// lets say files have [10, 20), [20, 30) then if our range is [15, 25], we need to include both files,
-		// because [15, 20] is included in the first file, and [20, 25] is included in the second file
-		// say we have b and e
-		// as a result, the first file(inclusive): largest file whose begin <= b,
-		// the last file(exclusive): smallest file whose begin > e
-		// because of the encoding, version comes before the type of files(log or range),
-		// begin needs to start from the beginning --
-		// if we have a 3 files, (log,100,200), (range, 180), (log, 200, 300), then if we want to restore[190, 250]
-		// it would stop at (range, 180) and not looking at (log, 100, 200)
-		state Optional<RestoreConfig::RestoreFile> beginLogInclude = Optional<RestoreConfig::RestoreFile>{};
-		// because of the encoding of RestoreFile, we use greaterThanOrEqual(end + 1) instead of greaterThan(end)
-		// because RestoreFile::pack has the version at the most significant position, and keyAfter(end) does not result
-		// in a end+1
-		state Optional<RestoreConfig::RestoreFile> endLogExclude = wait(
-		    restore.logFileSet().seekGreaterOrEqual(tr, RestoreConfig::RestoreFile({ endVersion + 1, "", false })));
-		state RestoreConfig::FileSetT::RangeResultType logFiles =
-		    wait(restore.logFileSet().getRange(tr, beginLogInclude, endLogExclude, fileLimit));
 		state Optional<RestoreConfig::RestoreFile> beginRangeInclude =
 		    wait(restore.rangeFileSet().seekGreaterOrEqual(tr, RestoreConfig::RestoreFile({ beginVersion, "", true })));
 		// greaterThanOrEqual(end + 1) instead of greaterThan(end)
@@ -5567,16 +5640,7 @@ struct RestoreDispatchPartitionedTaskFunc : RestoreTaskFuncBase {
 		    restore.rangeFileSet().seekGreaterOrEqual(tr, RestoreConfig::RestoreFile({ endVersion + 1, "", true })));
 		state RestoreConfig::FileSetT::RangeResultType rangeFiles =
 		    wait(restore.rangeFileSet().getRange(tr, beginRangeInclude, endRangeExclude, fileLimit));
-		state int64_t maxTagID = 0;
-		state std::vector<RestoreConfig::RestoreFile> logs;
 		state std::vector<RestoreConfig::RestoreFile> ranges;
-		for (auto f : logFiles.results) {
-			if (f.endVersion > beginVersion) {
-				// skip all files whose endVersion is smaller or equal to beginVersion
-				logs.push_back(f);
-				maxTagID = std::max(maxTagID, f.tagId);
-			}
-		}
 		for (auto f : rangeFiles.results) {
 			// the getRange might get out-of-bound range file because log files need them to work
 			if (f.version >= beginVersion && f.version < endVersion) {
@@ -5652,7 +5716,7 @@ struct RestoreDispatchPartitionedTaskFunc : RestoreTaskFuncBase {
 			}
 		}
 		addTaskFutures.push_back(RestoreLogDataPartitionedTaskFunc::addTask(
-		    tr, taskBucket, task, maxTagID, logs, beginVersion, endVersion, TaskCompletionKey::joinWith(allPartsDone)));
+		    tr, taskBucket, task, beginVersion, endVersion, TaskCompletionKey::joinWith(allPartsDone)));
 		// even if file exsists, but they are empty, in this case just start the next batch
 
 		addTaskFutures.push_back(RestoreDispatchPartitionedTaskFunc::addTask(tr,
@@ -6391,8 +6455,10 @@ struct StartFullRestoreTaskFunc : RestoreTaskFuncBase {
 			// In logs-only (incremental) mode, the firstConsistentVersion should just be restore.beginVersion().
 			firstConsistentVersion = beginVersion;
 		}
+		state Version maxLogFileSpan = 0;
 		if (!inconsistentSnapshotOnly) {
 			for (const LogFile& f : restorable.get().logs) {
+				maxLogFileSpan = std::max(maxLogFileSpan, f.endVersion - f.beginVersion);
 				files.push_back(
 				    { f.beginVersion, f.fileName, false, f.blockSize, f.fileSize, f.endVersion, f.tagId, f.totalTags });
 				logFiles.push_back(
@@ -6408,6 +6474,7 @@ struct StartFullRestoreTaskFunc : RestoreTaskFuncBase {
 				tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 				tr->setOption(FDBTransactionOptions::LOCK_AWARE);
 				restore.firstConsistentVersion().set(tr, firstConsistentVersion);
+				restore.maxLogFileSpan().set(tr, maxLogFileSpan);
 				wait(tr->commit());
 				break;
 			} catch (Error& e) {
